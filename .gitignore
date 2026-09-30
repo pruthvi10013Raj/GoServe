@@ -1,0 +1,12 @@
+# Uploaded files
+uploads/
+
+# Go binaries
+*.exe
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
+.idea/

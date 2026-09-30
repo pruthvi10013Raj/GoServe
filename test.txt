@@ -1,0 +1,1 @@
+This file is created so as to test the upload request in GoServe-Lightweight http/tcp server.
