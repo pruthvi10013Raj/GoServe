@@ -36,10 +36,14 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := r.ParseMultipartForm(10 << 20)
+	const maxUploadSize = 10 << 20 // 10 MB
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+
+	err := r.ParseMultipartForm(maxUploadSize)
 
 	if err != nil {
-		http.Error(w, "Unable to parse uploaded file", http.StatusBadRequest)
+		http.Error(w, "File too large or invalid upload", http.StatusBadRequest)
 		return
 	}
 
@@ -55,6 +59,24 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	filename := filepath.Base(header.Filename)
 
 	outputPath := filepath.Join("uploads", filename)
+
+	// Handle duplicate filenames
+	extension := filepath.Ext(filename)
+	name := filename[:len(filename)-len(extension)]
+
+	counter := 1
+
+	for {
+		if _, err := os.Stat(outputPath); os.IsNotExist(err) {
+			break
+		}
+
+		newFilename := fmt.Sprintf("%s_%d%s", name, counter, extension)
+
+		outputPath = filepath.Join("uploads", newFilename)
+
+		counter++
+	}
 
 	outputFile, err := os.Create(outputPath)
 
@@ -72,7 +94,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Fprintf(w, "File uploaded successfully: %s\n", filename)
+	fmt.Fprintf(w, "File uploaded successfully: %s\n", filepath.Base(outputPath))
 }
 
 func main() {
