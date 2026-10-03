@@ -114,7 +114,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 
-	port := flag.Int("port", 8080, "Port on which server will run")
+	port := flag.Int("port", 8443, "Port on which server will run")
 	directory := flag.String("dir", "./public", "Directory to serve")
 
 	flag.Parse()
@@ -131,10 +131,15 @@ func main() {
 
 	address := fmt.Sprintf(":%d", *port)
 
-	fmt.Printf("GoServe running on http://localhost%s\n", address)
+	fmt.Printf("GoServe running on https://localhost%s\n", address)
 	fmt.Printf("Serving directory: %s\n", *directory)
 
-	err := http.ListenAndServe(address, nil)
+	err := http.ListenAndServeTLS(
+		address,
+		"cert/server.crt",
+		"cert/server.key",
+		nil,
+	)
 
 	if err != nil {
 		fmt.Println("Server stopped:", err)
