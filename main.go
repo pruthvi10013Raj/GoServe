@@ -11,6 +11,21 @@ import (
 	"time"
 )
 
+func basicAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+		username, password, ok := r.BasicAuth()
+
+		if !ok || username != "admin" || password != "goserve123" {
+			w.Header().Set("WWW-Authenticate", `Basic realm="GoServe"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
@@ -110,7 +125,9 @@ func main() {
 
 	http.Handle("/", handler)
 
-	http.HandleFunc("/upload", uploadHandler)
+	uploadHandlerWithAuth := basicAuth(http.HandlerFunc(uploadHandler))
+
+	http.Handle("/upload", uploadHandlerWithAuth)
 
 	address := fmt.Sprintf(":%d", *port)
 
