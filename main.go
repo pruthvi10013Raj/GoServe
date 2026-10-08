@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -112,12 +113,55 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "File uploaded successfully: %s\n", filepath.Base(outputPath))
 }
 
+func handleTCPConnection(conn net.Conn) {
+
+	defer conn.Close()
+
+	log.Println("TCP client connected:", conn.RemoteAddr())
+
+	message := "Hello from GoServe TCP server!\n"
+
+	_, err := conn.Write([]byte(message))
+
+	if err != nil {
+		log.Println("TCP write error:", err)
+		return
+	}
+}
+
+func startTCPServer(port string) {
+
+	listener, err := net.Listen("tcp", port)
+
+	if err != nil {
+		log.Println("TCP server error:", err)
+		return
+	}
+
+	defer listener.Close()
+
+	log.Println("GoServe TCP server running on", port)
+
+	for {
+		conn, err := listener.Accept()
+
+		if err != nil {
+			log.Println("TCP connection error:", err)
+			continue
+		}
+
+		go handleTCPConnection(conn)
+	}
+}
+
 func main() {
 
 	port := flag.Int("port", 8443, "Port on which server will run")
 	directory := flag.String("dir", "./public", "Directory to serve")
 
 	flag.Parse()
+
+	go startTCPServer(":9090")
 
 	fileServer := http.FileServer(http.Dir(*directory))
 
