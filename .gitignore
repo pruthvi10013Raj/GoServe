@@ -10,3 +10,11 @@ uploads/
 # IDE
 .vscode/
 .idea/
+
+# TLS certificates
+cert/
+*.key
+*.crt
+
+# Testinig files for bigdata uploading
+*.bin
