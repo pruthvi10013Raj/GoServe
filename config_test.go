@@ -9,9 +9,6 @@ import (
 
 func TestDefaultServerConfig(t *testing.T) {
 	config := defaultServerConfig()
-	if err := config.validate(); err != nil {
-		t.Fatalf("default config is invalid: %v", err)
-	}
 	if config.HTTPSPort != 8443 || config.TCPPort != 9090 {
 		t.Errorf("default ports = (%d, %d), want (8443, 9090)", config.HTTPSPort, config.TCPPort)
 	}
@@ -20,6 +17,27 @@ func TestDefaultServerConfig(t *testing.T) {
 	}
 	if config.MaxUploadSize != 10<<20 {
 		t.Errorf("default upload limit = %d, want %d", config.MaxUploadSize, 10<<20)
+	}
+}
+
+func TestLoadServerConfigWithoutPathUsesDefaults(t *testing.T) {
+	config, err := loadServerConfig("")
+	if err != nil {
+		t.Fatalf("load defaults without config path: %v", err)
+	}
+	defaults := defaultServerConfig()
+	if config != defaults {
+		t.Errorf("config without path = %+v, want defaults %+v", config, defaults)
+	}
+}
+
+func TestLoadServerConfigMissingFileReturnsError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.yaml")
+	if _, err := loadServerConfig(path); err == nil {
+		t.Fatal("loading missing config file succeeded, want an error")
+	}
+	if _, err := parseServerConfig([]string{"-config", path}); err == nil {
+		t.Fatal("starting with a missing config file succeeded, want an error")
 	}
 }
 
@@ -104,6 +122,7 @@ func TestParseServerConfigAppliesCLIOverYAML(t *testing.T) {
 	if err := os.Mkdir(cliUploadDirectory, 0755); err != nil {
 		t.Fatal(err)
 	}
+	cliStaticDirectory := t.TempDir()
 	data := []byte("https_port: 9443\ntcp_port: 9191\nstatic_directory: " + staticDirectory + "\nupload_directory: " + uploadDirectory + "\nmax_upload_size: 2048\n")
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
@@ -112,19 +131,22 @@ func TestParseServerConfigAppliesCLIOverYAML(t *testing.T) {
 	config, err := parseServerConfig([]string{
 		"-config", path,
 		"-https-port", "10443",
+		"-tcp-port", "9292",
+		"-static-dir", cliStaticDirectory,
 		"-upload-dir", cliUploadDirectory,
+		"-max-upload-size", "4096",
 	})
 	if err != nil {
 		t.Fatalf("parse server config: %v", err)
 	}
-	if config.HTTPSPort != 10443 || config.TCPPort != 9191 {
-		t.Errorf("ports = (%d, %d), want (10443, 9191)", config.HTTPSPort, config.TCPPort)
+	if config.HTTPSPort != 10443 || config.TCPPort != 9292 {
+		t.Errorf("ports = (%d, %d), want (10443, 9292)", config.HTTPSPort, config.TCPPort)
 	}
-	if config.StaticDirectory != staticDirectory || config.UploadDirectory != cliUploadDirectory {
-		t.Errorf("directories = (%q, %q), want (%q, %q)", config.StaticDirectory, config.UploadDirectory, staticDirectory, cliUploadDirectory)
+	if config.StaticDirectory != cliStaticDirectory || config.UploadDirectory != cliUploadDirectory {
+		t.Errorf("directories = (%q, %q), want (%q, %q)", config.StaticDirectory, config.UploadDirectory, cliStaticDirectory, cliUploadDirectory)
 	}
-	if config.MaxUploadSize != 2048 {
-		t.Errorf("upload limit = %d, want 2048", config.MaxUploadSize)
+	if config.MaxUploadSize != 4096 {
+		t.Errorf("upload limit = %d, want 4096", config.MaxUploadSize)
 	}
 }
 
@@ -151,6 +173,51 @@ func TestLoadServerConfigRejectsUnknownFieldsAndMultipleDocuments(t *testing.T) 
 		if _, err := loadServerConfig(path); err == nil {
 			t.Errorf("load config %q succeeded, want error", contents)
 		}
+	}
+}
+
+func TestLoadServerConfigRejectsInvalidYAMLValues(t *testing.T) {
+	for _, contents := range []string{
+		"https_port: not-a-port\n",
+		"tcp_port: 9090\nmax_upload_size: not-a-size\n",
+	} {
+		t.Run(strings.ReplaceAll(strings.TrimSpace(contents), "\n", "_"), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadServerConfig(path); err == nil {
+				t.Fatalf("load config %q succeeded, want an error", contents)
+			}
+		})
+	}
+}
+
+func TestParseServerConfigRejectsInvalidYAMLSettings(t *testing.T) {
+	staticDirectory := t.TempDir()
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{"HTTPS port out of range", "https_port: 70000"},
+		{"TCP port out of range", "tcp_port: 0"},
+		{"empty static directory", `static_directory: ""`},
+		{"empty upload directory", `upload_directory: ""`},
+		{"zero upload size", "max_upload_size: 0"},
+		{"negative upload size", "max_upload_size: -1"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			data := "static_directory: " + staticDirectory + "\n" + test.value + "\n"
+			if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := parseServerConfig([]string{"-config", path}); err == nil {
+				t.Fatalf("parse invalid setting %q succeeded, want an error", test.value)
+			}
+		})
 	}
 }
 
@@ -185,6 +252,8 @@ func TestServerConfigValidation(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			config := defaultServerConfig()
+			config.StaticDirectory = t.TempDir()
+			config.UploadDirectory = t.TempDir()
 			test.change(&config)
 			if err := config.validate(); err == nil {
 				t.Fatalf("validation error = %v, want a clear validation error", err)
@@ -197,6 +266,7 @@ func TestServerConfigValidation(t *testing.T) {
 
 func TestServerConfigAcceptsMissingUploadDirectoryWithExistingParent(t *testing.T) {
 	config := defaultServerConfig()
+	config.StaticDirectory = t.TempDir()
 	config.UploadDirectory = filepath.Join(t.TempDir(), "not-created-yet")
 	if err := config.validate(); err != nil {
 		t.Fatalf("config with creatable upload directory is invalid: %v", err)
