@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -10,6 +12,11 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+)
+
+const (
+	maxTCPRequestSize    = 1024
+	tcpConnectionTimeout = 5 * time.Second
 )
 
 func basicAuth(next http.Handler) http.Handler {
@@ -45,6 +52,27 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func createUniqueUploadFile(directory, filename string) (*os.File, string, error) {
+	extension := filepath.Ext(filename)
+	name := filename[:len(filename)-len(extension)]
+
+	for counter := 0; ; counter++ {
+		candidate := filename
+		if counter > 0 {
+			candidate = fmt.Sprintf("%s_%d%s", name, counter, extension)
+		}
+
+		outputPath := filepath.Join(directory, candidate)
+		outputFile, err := os.OpenFile(outputPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0666)
+		if err == nil {
+			return outputFile, outputPath, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, "", err
+		}
+	}
+}
+
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != http.MethodPost {
@@ -57,6 +85,9 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
 
 	err := r.ParseMultipartForm(maxUploadSize)
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
 
 	if err != nil {
 		http.Error(w, "File too large or invalid upload", http.StatusBadRequest)
@@ -74,43 +105,49 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	filename := filepath.Base(header.Filename)
 
-	outputPath := filepath.Join("uploads", filename)
-
-	// Handle duplicate filenames
-	extension := filepath.Ext(filename)
-	name := filename[:len(filename)-len(extension)]
-
-	counter := 1
-
-	for {
-		if _, err := os.Stat(outputPath); os.IsNotExist(err) {
-			break
-		}
-
-		newFilename := fmt.Sprintf("%s_%d%s", name, counter, extension)
-
-		outputPath = filepath.Join("uploads", newFilename)
-
-		counter++
-	}
-
-	outputFile, err := os.Create(outputPath)
-
-	if err != nil {
+	const uploadDirectory = "uploads"
+	if err := os.MkdirAll(uploadDirectory, 0755); err != nil {
+		log.Printf("Unable to create upload directory: %v", err)
 		http.Error(w, "Unable to save file", http.StatusInternalServerError)
 		return
 	}
 
-	defer outputFile.Close()
+	outputFile, outputPath, err := createUniqueUploadFile(uploadDirectory, filename)
+	if err != nil {
+		log.Printf("Unable to create upload file: %v", err)
+		http.Error(w, "Unable to save file", http.StatusInternalServerError)
+		return
+	}
 
 	_, err = io.Copy(outputFile, file)
+	closeErr := outputFile.Close()
 
 	if err != nil {
+		if removeErr := os.Remove(outputPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			log.Printf("Unable to remove incomplete upload: %v", removeErr)
+		}
+		log.Printf("Unable to write upload file: %v", err)
 		http.Error(w, "Unable to write file", http.StatusInternalServerError)
 		return
 	}
 
+	if closeErr != nil {
+		if removeErr := os.Remove(outputPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			log.Printf("Unable to remove incomplete upload: %v", removeErr)
+		}
+		log.Printf("Unable to close upload file: %v", closeErr)
+		http.Error(w, "Unable to save file", http.StatusInternalServerError)
+		return
+	}
+
 	fmt.Fprintf(w, "File uploaded successfully: %s\n", filepath.Base(outputPath))
+}
+
+func newHTTPHandler(directory string) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/", loggingMiddleware(http.FileServer(http.Dir(directory))))
+	mux.Handle("/upload", loggingMiddleware(basicAuth(http.HandlerFunc(uploadHandler))))
+	return mux
 }
 
 func handleTCPConnection(conn net.Conn) {
@@ -119,13 +156,44 @@ func handleTCPConnection(conn net.Conn) {
 
 	log.Println("TCP client connected:", conn.RemoteAddr())
 
-	message := "Hello from GoServe TCP server!\n"
+	if err := conn.SetReadDeadline(time.Now().Add(tcpConnectionTimeout)); err != nil {
+		log.Println("TCP read deadline error:", err)
+		return
+	}
 
-	_, err := conn.Write([]byte(message))
+	reader := bufio.NewReaderSize(conn, maxTCPRequestSize+1)
+	request, err := reader.ReadSlice('\n')
+
+	if err == bufio.ErrBufferFull || len(request) > maxTCPRequestSize+1 {
+		if err := conn.SetWriteDeadline(time.Now().Add(tcpConnectionTimeout)); err != nil {
+			log.Println("TCP write deadline error:", err)
+			return
+		}
+		if _, err := io.WriteString(conn, "ERR request too long\n"); err != nil {
+			log.Println("TCP write error:", err)
+		}
+		return
+	}
 
 	if err != nil {
-		log.Println("TCP write error:", err)
+		if err != io.EOF || len(request) > 0 {
+			log.Println("TCP read error:", err)
+		}
 		return
+	}
+
+	request = request[:len(request)-1]
+	if len(request) > 0 && request[len(request)-1] == '\r' {
+		request = request[:len(request)-1]
+	}
+
+	if err := conn.SetWriteDeadline(time.Now().Add(tcpConnectionTimeout)); err != nil {
+		log.Println("TCP write deadline error:", err)
+		return
+	}
+
+	if _, err := fmt.Fprintf(conn, "Echo: %s\n", request); err != nil {
+		log.Println("TCP write error:", err)
 	}
 }
 
@@ -163,16 +231,6 @@ func main() {
 
 	go startTCPServer(":9090")
 
-	fileServer := http.FileServer(http.Dir(*directory))
-
-	handler := loggingMiddleware(fileServer)
-
-	http.Handle("/", handler)
-
-	uploadHandlerWithAuth := basicAuth(http.HandlerFunc(uploadHandler))
-
-	http.Handle("/upload", uploadHandlerWithAuth)
-
 	address := fmt.Sprintf(":%d", *port)
 
 	fmt.Printf("GoServe running on https://localhost%s\n", address)
@@ -182,7 +240,7 @@ func main() {
 		address,
 		"cert/server.crt",
 		"cert/server.key",
-		nil,
+		newHTTPHandler(*directory),
 	)
 
 	if err != nil {
