@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-func TestHandleTCPConnectionEchoesRequest(t *testing.T) {
+func TestHandleTCPConnectionRespondsWithReceivedMessage(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer clientConn.Close()
 
@@ -36,7 +36,30 @@ func TestHandleTCPConnectionEchoesRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read response: %v", err)
 	}
-	if want := "Echo: hello GoServe\n"; response != want {
+	if want := "Received: hello GoServe\n"; response != want {
+		t.Errorf("response = %q, want %q", response, want)
+	}
+}
+
+func TestHandleTCPConnectionAcceptsEmptyRequest(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	go handleTCPConnection(serverConn)
+
+	if _, err := clientConn.Write([]byte("\n")); err != nil {
+		t.Fatalf("write empty request: %v", err)
+	}
+
+	if err := clientConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+
+	response, err := bufio.NewReader(clientConn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if want := "Received: \n"; response != want {
 		t.Errorf("response = %q, want %q", response, want)
 	}
 }

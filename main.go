@@ -192,7 +192,7 @@ func handleTCPConnection(conn net.Conn) {
 		return
 	}
 
-	if _, err := fmt.Fprintf(conn, "Echo: %s\n", request); err != nil {
+	if _, err := fmt.Fprintf(conn, "Received: %s\n", request); err != nil {
 		log.Println("TCP write error:", err)
 	}
 }
