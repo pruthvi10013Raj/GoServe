@@ -13,11 +13,16 @@ import (
 )
 
 const (
-	maxMessageSize = 1024
-	clientTimeout  = 5 * time.Second
+	maxMessageSize  = 1024
+	maxResponseSize = len("Received: ") + maxMessageSize + 1
+	clientTimeout   = 5 * time.Second
 )
 
 func request(address, message string) (string, error) {
+	return requestWithTimeout(address, message, clientTimeout)
+}
+
+func requestWithTimeout(address, message string, timeout time.Duration) (string, error) {
 	if strings.ContainsAny(message, "\r\n") {
 		return "", errors.New("message must be a single line")
 	}
@@ -25,24 +30,27 @@ func request(address, message string) (string, error) {
 		return "", fmt.Errorf("message exceeds %d bytes", maxMessageSize)
 	}
 
-	conn, err := net.DialTimeout("tcp", address, clientTimeout)
+	conn, err := net.DialTimeout("tcp", address, timeout)
 	if err != nil {
 		return "", fmt.Errorf("connect to %s: %w", address, err)
 	}
 	defer conn.Close()
 
-	if err := conn.SetDeadline(time.Now().Add(clientTimeout)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return "", fmt.Errorf("set connection deadline: %w", err)
 	}
 	if _, err := io.WriteString(conn, message+"\n"); err != nil {
 		return "", fmt.Errorf("send request: %w", err)
 	}
 
-	response, err := bufio.NewReader(conn).ReadString('\n')
+	response, err := bufio.NewReaderSize(conn, maxResponseSize+1).ReadSlice('\n')
+	if err == bufio.ErrBufferFull || len(response) > maxResponseSize {
+		return "", fmt.Errorf("response exceeds %d bytes", maxResponseSize)
+	}
 	if err != nil {
 		return "", fmt.Errorf("read response: %w", err)
 	}
-	return response, nil
+	return string(response), nil
 }
 
 func main() {

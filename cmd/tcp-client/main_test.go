@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -37,8 +38,16 @@ func TestRequestSendsMessageAndReadsResponse(t *testing.T) {
 			serverErr <- fmt.Errorf("request = %q, want %q", message, "hello GoServe\n")
 			return
 		}
-		_, err = fmt.Fprint(conn, "Received: hello GoServe\n")
-		serverErr <- err
+		if _, err := fmt.Fprint(conn, "Received: hello GoServe\n"); err != nil {
+			serverErr <- err
+			return
+		}
+		_, err = bufio.NewReader(conn).ReadByte()
+		if err != io.EOF {
+			serverErr <- fmt.Errorf("client close error = %v, want EOF", err)
+			return
+		}
+		serverErr <- nil
 	}()
 
 	response, err := request(listener.Addr().String(), "hello GoServe")
@@ -58,5 +67,74 @@ func TestRequestRejectsInvalidMessagesBeforeConnecting(t *testing.T) {
 		if _, err := request("invalid address", message); err == nil {
 			t.Errorf("request(%q) succeeded, want validation error", message)
 		}
+	}
+}
+
+func TestRequestRejectsOversizedResponse(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = fmt.Fprint(conn, string(make([]byte, maxResponseSize+1))+"\n")
+	}()
+
+	if _, err := request(listener.Addr().String(), "hello"); err == nil {
+		t.Fatal("request succeeded, want oversized response error")
+	}
+}
+
+func TestRequestReturnsErrorOnServerDisconnect(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}()
+
+	if _, err := request(listener.Addr().String(), "hello"); err == nil {
+		t.Fatal("request succeeded, want server disconnect error")
+	}
+}
+
+func TestRequestDeadlineBoundsResponseWait(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = bufio.NewReader(conn).ReadString('\n')
+		_, _ = bufio.NewReader(conn).ReadByte()
+	}()
+
+	if _, err := requestWithTimeout(listener.Addr().String(), "hello", 50*time.Millisecond); err == nil {
+		t.Fatal("request succeeded, want response timeout")
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("test server did not observe client close after timeout")
 	}
 }

@@ -151,12 +151,15 @@ func newHTTPHandler(directory string) http.Handler {
 }
 
 func handleTCPConnection(conn net.Conn) {
+	handleTCPConnectionWithTimeout(conn, tcpConnectionTimeout)
+}
 
+func handleTCPConnectionWithTimeout(conn net.Conn, timeout time.Duration) {
 	defer conn.Close()
 
 	log.Println("TCP client connected:", conn.RemoteAddr())
 
-	if err := conn.SetReadDeadline(time.Now().Add(tcpConnectionTimeout)); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		log.Println("TCP read deadline error:", err)
 		return
 	}
@@ -165,7 +168,7 @@ func handleTCPConnection(conn net.Conn) {
 	request, err := reader.ReadSlice('\n')
 
 	if err == bufio.ErrBufferFull || len(request) > maxTCPRequestSize+1 {
-		if err := conn.SetWriteDeadline(time.Now().Add(tcpConnectionTimeout)); err != nil {
+		if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 			log.Println("TCP write deadline error:", err)
 			return
 		}
@@ -187,7 +190,7 @@ func handleTCPConnection(conn net.Conn) {
 		request = request[:len(request)-1]
 	}
 
-	if err := conn.SetWriteDeadline(time.Now().Add(tcpConnectionTimeout)); err != nil {
+	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		log.Println("TCP write deadline error:", err)
 		return
 	}

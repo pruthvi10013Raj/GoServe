@@ -22,7 +22,11 @@ func TestHandleTCPConnectionRespondsWithReceivedMessage(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer clientConn.Close()
 
-	go handleTCPConnection(serverConn)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		handleTCPConnection(serverConn)
+	}()
 
 	if _, err := clientConn.Write([]byte("hello GoServe\r\n")); err != nil {
 		t.Fatalf("write request: %v", err)
@@ -38,6 +42,14 @@ func TestHandleTCPConnectionRespondsWithReceivedMessage(t *testing.T) {
 	}
 	if want := "Received: hello GoServe\n"; response != want {
 		t.Errorf("response = %q, want %q", response, want)
+	}
+	if _, err := bufio.NewReader(clientConn).ReadByte(); err != io.EOF {
+		t.Errorf("read after response error = %v, want EOF", err)
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("server handler did not return after responding")
 	}
 }
 
@@ -83,6 +95,73 @@ func TestHandleTCPConnectionRejectsOversizedRequest(t *testing.T) {
 	}
 	if want := "ERR request too long\n"; response != want {
 		t.Errorf("response = %q, want %q", response, want)
+	}
+}
+
+func TestHandleTCPConnectionAcceptsMaximumRequest(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	go handleTCPConnection(serverConn)
+	message := strings.Repeat("x", maxTCPRequestSize)
+	if _, err := clientConn.Write([]byte(message + "\n")); err != nil {
+		t.Fatalf("write maximum request: %v", err)
+	}
+	if err := clientConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+
+	response, err := bufio.NewReader(clientConn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if want := "Received: " + message + "\n"; response != want {
+		t.Errorf("response length = %d, want %d", len(response), len(want))
+	}
+}
+
+func TestHandleTCPConnectionReturnsAfterClientDisconnect(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		handleTCPConnection(serverConn)
+	}()
+
+	if _, err := clientConn.Write([]byte("partial")); err != nil {
+		t.Fatalf("write partial request: %v", err)
+	}
+	if err := clientConn.Close(); err != nil {
+		t.Fatalf("close client connection: %v", err)
+	}
+
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("server handler did not return after client disconnect")
+	}
+}
+
+func TestHandleTCPConnectionClosesIdleClientAfterDeadline(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		handleTCPConnectionWithTimeout(serverConn, 50*time.Millisecond)
+	}()
+
+	if err := clientConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	if _, err := bufio.NewReader(clientConn).ReadByte(); err != io.EOF {
+		t.Fatalf("read from idle connection error = %v, want EOF", err)
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("server handler did not return after read deadline")
 	}
 }
 
