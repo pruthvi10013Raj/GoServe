@@ -1,0 +1,5 @@
+https_port: 8443
+tcp_port: 9090
+static_directory: ./public
+upload_directory: ./uploads
+max_upload_size: 10485760

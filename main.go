@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -74,17 +73,19 @@ func createUniqueUploadFile(directory, filename string) (*os.File, string, error
 }
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
+	config := defaultServerConfig()
+	uploadHandlerWithConfig(w, r, config)
+}
 
+func uploadHandlerWithConfig(w http.ResponseWriter, r *http.Request, config serverConfig) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Only POST method is allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	const maxUploadSize = 10 << 20 // 10 MB
+	r.Body = http.MaxBytesReader(w, r.Body, config.MaxUploadSize)
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
-
-	err := r.ParseMultipartForm(maxUploadSize)
+	err := r.ParseMultipartForm(config.MaxUploadSize)
 	if r.MultipartForm != nil {
 		defer r.MultipartForm.RemoveAll()
 	}
@@ -105,14 +106,13 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	filename := filepath.Base(header.Filename)
 
-	const uploadDirectory = "uploads"
-	if err := os.MkdirAll(uploadDirectory, 0755); err != nil {
+	if err := os.MkdirAll(config.UploadDirectory, 0755); err != nil {
 		log.Printf("Unable to create upload directory: %v", err)
 		http.Error(w, "Unable to save file", http.StatusInternalServerError)
 		return
 	}
 
-	outputFile, outputPath, err := createUniqueUploadFile(uploadDirectory, filename)
+	outputFile, outputPath, err := createUniqueUploadFile(config.UploadDirectory, filename)
 	if err != nil {
 		log.Printf("Unable to create upload file: %v", err)
 		http.Error(w, "Unable to save file", http.StatusInternalServerError)
@@ -144,9 +144,17 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func newHTTPHandler(directory string) http.Handler {
+	config := defaultServerConfig()
+	config.StaticDirectory = directory
+	return newConfiguredHTTPHandler(config)
+}
+
+func newConfiguredHTTPHandler(config serverConfig) http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("/", loggingMiddleware(http.FileServer(http.Dir(directory))))
-	mux.Handle("/upload", loggingMiddleware(basicAuth(http.HandlerFunc(uploadHandler))))
+	mux.Handle("/", loggingMiddleware(http.FileServer(http.Dir(config.StaticDirectory))))
+	mux.Handle("/upload", loggingMiddleware(basicAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploadHandlerWithConfig(w, r, config)
+	}))))
 	return mux
 }
 
@@ -225,28 +233,32 @@ func startTCPServer(port string) {
 	}
 }
 
-func main() {
+func run(args []string) error {
+	config, err := parseServerConfig(args)
+	if err != nil {
+		return err
+	}
 
-	port := flag.Int("port", 8443, "Port on which server will run")
-	directory := flag.String("dir", "./public", "Directory to serve")
+	go startTCPServer(fmt.Sprintf(":%d", config.TCPPort))
 
-	flag.Parse()
-
-	go startTCPServer(":9090")
-
-	address := fmt.Sprintf(":%d", *port)
-
+	address := fmt.Sprintf(":%d", config.HTTPSPort)
 	fmt.Printf("GoServe running on https://localhost%s\n", address)
-	fmt.Printf("Serving directory: %s\n", *directory)
+	fmt.Printf("Serving directory: %s\n", config.StaticDirectory)
 
-	err := http.ListenAndServeTLS(
+	if err := http.ListenAndServeTLS(
 		address,
 		"cert/server.crt",
 		"cert/server.key",
-		newHTTPHandler(*directory),
-	)
+		newConfiguredHTTPHandler(config),
+	); err != nil {
+		return fmt.Errorf("HTTPS server stopped: %w", err)
+	}
+	return nil
+}
 
-	if err != nil {
-		fmt.Println("Server stopped:", err)
+func main() {
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 }

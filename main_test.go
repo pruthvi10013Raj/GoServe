@@ -280,6 +280,49 @@ func TestUploadRouteLogsUnauthorizedRequests(t *testing.T) {
 	}
 }
 
+func TestConfiguredHTTPHandlerUsesUploadDirectoryAndSizeLimit(t *testing.T) {
+	root := t.TempDir()
+	staticDirectory := filepath.Join(root, "public")
+	if err := os.MkdirAll(staticDirectory, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staticDirectory, "hello.txt"), []byte("static content"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	uploadDirectory := filepath.Join(root, "stored")
+	config := defaultServerConfig()
+	config.StaticDirectory = staticDirectory
+	config.UploadDirectory = uploadDirectory
+	config.MaxUploadSize = 512
+	handler := newConfiguredHTTPHandler(config)
+
+	staticResponse := httptest.NewRecorder()
+	handler.ServeHTTP(staticResponse, httptest.NewRequest(http.MethodGet, "/hello.txt", nil))
+	if staticResponse.Code != http.StatusOK || staticResponse.Body.String() != "static content" {
+		t.Fatalf("static response = (%d, %q), want (200, %q)", staticResponse.Code, staticResponse.Body.String(), "static content")
+	}
+
+	uploadResponse := postUpload(t, handler, "saved.txt", "small")
+	if uploadResponse.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, want %d", uploadResponse.Code, http.StatusOK)
+	}
+	saved, err := os.ReadFile(filepath.Join(uploadDirectory, "saved.txt"))
+	if err != nil {
+		t.Fatalf("read configured upload: %v", err)
+	}
+	if string(saved) != "small" {
+		t.Errorf("saved content = %q, want %q", saved, "small")
+	}
+
+	tooLarge := postUpload(t, handler, "large.txt", strings.Repeat("x", 1024))
+	if tooLarge.Code != http.StatusBadRequest {
+		t.Errorf("oversized upload status = %d, want %d", tooLarge.Code, http.StatusBadRequest)
+	}
+	if _, err := os.Stat(filepath.Join(uploadDirectory, "large.txt")); !os.IsNotExist(err) {
+		t.Errorf("oversized upload file exists or stat failed unexpectedly: %v", err)
+	}
+}
+
 func postUpload(t *testing.T, handler http.Handler, filename, content string) *httptest.ResponseRecorder {
 	t.Helper()
 
