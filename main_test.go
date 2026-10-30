@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -82,7 +83,7 @@ func TestHandleTCPConnectionRejectsOversizedRequest(t *testing.T) {
 	defer clientConn.Close()
 
 	go handleTCPConnection(serverConn)
-	if _, err := clientConn.Write([]byte(strings.Repeat("x", maxTCPRequestSize+1))); err != nil {
+	if _, err := clientConn.Write([]byte(strings.Repeat("x", maxTCPRequestSize+1) + "\n")); err != nil {
 		t.Fatalf("write oversized request: %v", err)
 	}
 
@@ -118,6 +119,50 @@ func TestHandleTCPConnectionAcceptsMaximumRequest(t *testing.T) {
 	}
 	if want := "Received: " + message + "\n"; response != want {
 		t.Errorf("response length = %d, want %d", len(response), len(want))
+	}
+}
+
+func TestHandleTCPConnectionAcceptsMaximumCRLFRequest(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	go handleTCPConnection(serverConn)
+	message := strings.Repeat("x", maxTCPRequestSize)
+	if _, err := clientConn.Write([]byte(message + "\r\n")); err != nil {
+		t.Fatalf("write maximum CRLF request: %v", err)
+	}
+	if err := clientConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+
+	response, err := bufio.NewReader(clientConn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if want := "Received: " + message + "\n"; response != want {
+		t.Errorf("response length = %d, want %d", len(response), len(want))
+	}
+}
+
+func TestHandleTCPConnectionRejectsOversizedCRLFRequest(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	go handleTCPConnection(serverConn)
+	message := strings.Repeat("x", maxTCPRequestSize+1)
+	go func() {
+		_, _ = clientConn.Write([]byte(message + "\r\n"))
+	}()
+	if err := clientConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+
+	response, err := bufio.NewReader(clientConn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if want := "ERR request too long\n"; response != want {
+		t.Errorf("response = %q, want %q", response, want)
 	}
 }
 
@@ -528,6 +573,68 @@ func TestUploadAuthenticationFailsClosedWhenNotConfigured(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusServiceUnavailable {
 		t.Errorf("unconfigured upload auth status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestUploadRoutePreservesAuthenticationAndMethodStatuses(t *testing.T) {
+	config := testServerConfig()
+	config.StaticDirectory = t.TempDir()
+	config.UploadDirectory = filepath.Join(t.TempDir(), "uploads")
+	handler := newConfiguredHTTPHandler(config)
+
+	unauthorized := httptest.NewRecorder()
+	unauthorizedRequest := httptest.NewRequest(http.MethodPost, "/upload", nil)
+	unauthorizedRequest.SetBasicAuth(testUploadUsername, "wrong-password")
+	handler.ServeHTTP(unauthorized, unauthorizedRequest)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Errorf("wrong credentials status = %d, want %d", unauthorized.Code, http.StatusUnauthorized)
+	}
+
+	authorized := httptest.NewRecorder()
+	authorizedRequest := httptest.NewRequest(http.MethodGet, "/upload", nil)
+	authorizedRequest.SetBasicAuth(testUploadUsername, testUploadPassword)
+	handler.ServeHTTP(authorized, authorizedRequest)
+	if authorized.Code != http.StatusMethodNotAllowed {
+		t.Errorf("authenticated GET /upload status = %d, want %d", authorized.Code, http.StatusMethodNotAllowed)
+	}
+
+	descendant := httptest.NewRecorder()
+	descendantRequest := httptest.NewRequest(http.MethodPost, "/upload/private", nil)
+	handler.ServeHTTP(descendant, descendantRequest)
+	if descendant.Code != http.StatusNotFound {
+		t.Errorf("POST /upload/private status = %d, want %d", descendant.Code, http.StatusNotFound)
+	}
+}
+
+func TestRunCleansTCPListenerWhenHTTPSStartupFails(t *testing.T) {
+	reservation, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpPort := reservation.Addr().(*net.TCPAddr).Port
+	if err := reservation.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv(uploadUsernameEnv, testUploadUsername)
+	t.Setenv(uploadPasswordEnv, testUploadPassword)
+	staticDirectory := t.TempDir()
+	startupErr := errors.New("simulated TLS certificate startup failure")
+	err = runWithHTTPS(context.Background(), []string{
+		"-https-port", fmt.Sprint(tcpPort),
+		"-tcp-port", fmt.Sprint(tcpPort),
+		"-static-dir", staticDirectory,
+	}, func(*http.Server) error {
+		return startupErr
+	})
+	if !errors.Is(err, startupErr) || !strings.Contains(err.Error(), "HTTPS server stopped") {
+		t.Fatalf("run error = %v, want wrapped HTTPS startup error", err)
+	}
+
+	connection, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", fmt.Sprint(tcpPort)), 100*time.Millisecond)
+	if err == nil {
+		_ = connection.Close()
+		t.Fatal("TCP listener still accepts connections after HTTPS startup failed")
 	}
 }
 

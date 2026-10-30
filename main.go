@@ -242,17 +242,11 @@ func handleTCPConnectionWithTimeout(conn net.Conn, timeout time.Duration) {
 		return
 	}
 
-	reader := bufio.NewReaderSize(conn, maxTCPRequestSize+1)
+	reader := bufio.NewReaderSize(conn, maxTCPRequestSize+2)
 	request, err := reader.ReadSlice('\n')
 
-	if err == bufio.ErrBufferFull || len(request) > maxTCPRequestSize+1 {
-		if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
-			log.Println("TCP write deadline error:", err)
-			return
-		}
-		if _, err := io.WriteString(conn, "ERR request too long\n"); err != nil {
-			log.Println("TCP write error:", err)
-		}
+	if err == bufio.ErrBufferFull || len(request) > maxTCPRequestSize+2 {
+		writeTCPError(conn, timeout)
 		return
 	}
 
@@ -267,6 +261,10 @@ func handleTCPConnectionWithTimeout(conn net.Conn, timeout time.Duration) {
 	if len(request) > 0 && request[len(request)-1] == '\r' {
 		request = request[:len(request)-1]
 	}
+	if len(request) > maxTCPRequestSize {
+		writeTCPError(conn, timeout)
+		return
+	}
 
 	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		log.Println("TCP write deadline error:", err)
@@ -274,6 +272,16 @@ func handleTCPConnectionWithTimeout(conn net.Conn, timeout time.Duration) {
 	}
 
 	if _, err := fmt.Fprintf(conn, "Received: %s\n", request); err != nil {
+		log.Println("TCP write error:", err)
+	}
+}
+
+func writeTCPError(conn net.Conn, timeout time.Duration) {
+	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		log.Println("TCP write deadline error:", err)
+		return
+	}
+	if _, err := io.WriteString(conn, "ERR request too long\n"); err != nil {
 		log.Println("TCP write error:", err)
 	}
 }
@@ -373,6 +381,12 @@ func shutdownHTTPServer(server *http.Server) error {
 }
 
 func run(ctx context.Context, args []string) error {
+	return runWithHTTPS(ctx, args, func(server *http.Server) error {
+		return server.ListenAndServeTLS("cert/server.crt", "cert/server.key")
+	})
+}
+
+func runWithHTTPS(ctx context.Context, args []string, serveHTTPS func(*http.Server) error) error {
 	config, err := parseServerConfig(args)
 	if err != nil {
 		return err
@@ -388,12 +402,12 @@ func run(ctx context.Context, args []string) error {
 	}
 
 	server := newHTTPServer(config)
-	fmt.Printf("GoServe running on https://localhost%s\n", server.Addr)
+	fmt.Printf("Starting GoServe HTTPS on https://localhost%s\n", server.Addr)
 	fmt.Printf("Serving directory: %s\n", config.StaticDirectory)
 
 	serveErr := make(chan error, 1)
 	go func() {
-		serveErr <- server.ListenAndServeTLS("cert/server.crt", "cert/server.key")
+		serveErr <- serveHTTPS(server)
 	}()
 
 	select {
