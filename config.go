@@ -18,6 +18,7 @@ type serverConfig struct {
 	StaticDirectory string
 	UploadDirectory string
 	MaxUploadSize   int64
+	UploadAuth      uploadCredentials
 }
 
 type yamlServerConfig struct {

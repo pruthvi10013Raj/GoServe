@@ -24,14 +24,36 @@ const (
 	readHeaderTimeout    = 5 * time.Second
 	idleTimeout          = 60 * time.Second
 	httpShutdownTimeout  = 10 * time.Second
+	uploadUsernameEnv    = "GOSERVE_UPLOAD_USERNAME"
+	uploadPasswordEnv    = "GOSERVE_UPLOAD_PASSWORD"
 )
 
-func basicAuth(next http.Handler) http.Handler {
+type uploadCredentials struct {
+	username string
+	password string
+}
+
+func uploadCredentialsFromEnvironment(getenv func(string) string) (uploadCredentials, error) {
+	credentials := uploadCredentials{
+		username: getenv(uploadUsernameEnv),
+		password: getenv(uploadPasswordEnv),
+	}
+	if strings.TrimSpace(credentials.username) == "" || strings.TrimSpace(credentials.password) == "" {
+		return uploadCredentials{}, fmt.Errorf("%s and %s must both be set to enable protected uploads", uploadUsernameEnv, uploadPasswordEnv)
+	}
+	return credentials, nil
+}
+
+func basicAuth(credentials uploadCredentials, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.TrimSpace(credentials.username) == "" || strings.TrimSpace(credentials.password) == "" {
+			http.Error(w, "Upload authentication is not configured", http.StatusServiceUnavailable)
+			return
+		}
 
 		username, password, ok := r.BasicAuth()
 
-		if !ok || username != "admin" || password != "goserve123" {
+		if !ok || username != credentials.username || password != credentials.password {
 			w.Header().Set("WWW-Authenticate", `Basic realm="GoServe"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
@@ -41,7 +63,7 @@ func basicAuth(next http.Handler) http.Handler {
 	})
 }
 
-func loggingMiddleware(next http.Handler) http.Handler {
+func loggingMiddleware(route string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
 		start := time.Now()
@@ -53,7 +75,7 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		log.Printf(
 			"%s %s %v",
 			r.Method,
-			r.URL.Path,
+			route,
 			duration,
 		)
 	})
@@ -118,11 +140,6 @@ func saveUploadedFile(directory, filename string, source io.Reader) (string, err
 	}
 
 	return filepath.Base(outputPath), nil
-}
-
-func uploadHandler(w http.ResponseWriter, r *http.Request) {
-	config := defaultServerConfig()
-	uploadHandlerWithConfig(w, r, config)
 }
 
 func uploadHandlerWithConfig(w http.ResponseWriter, r *http.Request, config serverConfig) {
@@ -195,8 +212,8 @@ func newHTTPHandler(directory string) http.Handler {
 
 func newConfiguredHTTPHandler(config serverConfig) http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("/", loggingMiddleware(http.FileServer(http.Dir(config.StaticDirectory))))
-	mux.Handle("/upload", loggingMiddleware(basicAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/", loggingMiddleware("/", http.FileServer(http.Dir(config.StaticDirectory))))
+	mux.Handle("/upload", loggingMiddleware("/upload", basicAuth(config.UploadAuth, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		uploadHandlerWithConfig(w, r, config)
 	}))))
 	return mux
@@ -357,6 +374,10 @@ func shutdownHTTPServer(server *http.Server) error {
 
 func run(ctx context.Context, args []string) error {
 	config, err := parseServerConfig(args)
+	if err != nil {
+		return err
+	}
+	config.UploadAuth, err = uploadCredentialsFromEnvironment(os.Getenv)
 	if err != nil {
 		return err
 	}

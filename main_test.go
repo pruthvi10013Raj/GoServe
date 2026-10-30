@@ -168,7 +168,7 @@ func TestHandleTCPConnectionClosesIdleClientAfterDeadline(t *testing.T) {
 
 func TestUploadHandlerCreatesDirectoryAndUniqueNames(t *testing.T) {
 	uploadDirectory := filepath.Join(t.TempDir(), "uploads")
-	config := defaultServerConfig()
+	config := testServerConfig()
 	config.StaticDirectory = t.TempDir()
 	config.UploadDirectory = uploadDirectory
 	handler := newConfiguredHTTPHandler(config)
@@ -203,14 +203,14 @@ func TestUploadHandlerCreatesDirectoryAndUniqueNames(t *testing.T) {
 }
 
 func TestUploadHandlerRejectsInvalidAndMissingFileFields(t *testing.T) {
-	config := defaultServerConfig()
+	config := testServerConfig()
 	config.StaticDirectory = t.TempDir()
 	config.UploadDirectory = filepath.Join(t.TempDir(), "uploads")
 	handler := newConfiguredHTTPHandler(config)
 
 	invalidRequest := httptest.NewRequest(http.MethodPost, "/upload", strings.NewReader("not multipart"))
 	invalidRequest.Header.Set("Content-Type", "text/plain")
-	invalidRequest.SetBasicAuth("admin", "goserve123")
+	invalidRequest.SetBasicAuth(testUploadUsername, testUploadPassword)
 	invalidResponse := httptest.NewRecorder()
 	handler.ServeHTTP(invalidResponse, invalidRequest)
 	if invalidResponse.Code != http.StatusBadRequest {
@@ -227,7 +227,7 @@ func TestUploadHandlerRejectsInvalidAndMissingFileFields(t *testing.T) {
 	}
 	missingRequest := httptest.NewRequest(http.MethodPost, "/upload", &body)
 	missingRequest.Header.Set("Content-Type", writer.FormDataContentType())
-	missingRequest.SetBasicAuth("admin", "goserve123")
+	missingRequest.SetBasicAuth(testUploadUsername, testUploadPassword)
 	missingResponse := httptest.NewRecorder()
 	handler.ServeHTTP(missingResponse, missingRequest)
 	if missingResponse.Code != http.StatusBadRequest {
@@ -237,7 +237,7 @@ func TestUploadHandlerRejectsInvalidAndMissingFileFields(t *testing.T) {
 
 func TestUploadHandlerSanitizesClientFilename(t *testing.T) {
 	uploadDirectory := filepath.Join(t.TempDir(), "uploads")
-	config := defaultServerConfig()
+	config := testServerConfig()
 	config.StaticDirectory = t.TempDir()
 	config.UploadDirectory = uploadDirectory
 	handler := newConfiguredHTTPHandler(config)
@@ -328,7 +328,7 @@ func TestCreateUniqueUploadFileIsSafeForConcurrentCalls(t *testing.T) {
 func TestUploadHandlerAllocatesUniqueNamesForConcurrentDuplicates(t *testing.T) {
 	const uploadCount = 16
 	uploadDirectory := filepath.Join(t.TempDir(), "uploads")
-	config := defaultServerConfig()
+	config := testServerConfig()
 	config.StaticDirectory = t.TempDir()
 	config.UploadDirectory = uploadDirectory
 	handler := newConfiguredHTTPHandler(config)
@@ -385,7 +385,9 @@ func TestUploadRouteLogsUnauthorizedRequests(t *testing.T) {
 		log.SetOutput(previousLogOutput)
 	})
 
-	handler := newHTTPHandler(t.TempDir())
+	config := testServerConfig()
+	config.StaticDirectory = t.TempDir()
+	handler := newConfiguredHTTPHandler(config)
 	request := httptest.NewRequest(http.MethodGet, "/upload", nil)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
@@ -408,7 +410,7 @@ func TestConfiguredHTTPHandlerUsesUploadDirectoryAndSizeLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	uploadDirectory := filepath.Join(root, "stored")
-	config := defaultServerConfig()
+	config := testServerConfig()
 	config.StaticDirectory = staticDirectory
 	config.UploadDirectory = uploadDirectory
 	config.MaxUploadSize = 512
@@ -442,7 +444,7 @@ func TestConfiguredHTTPHandlerUsesUploadDirectoryAndSizeLimit(t *testing.T) {
 }
 
 func TestNewHTTPServerConfiguresAddressHandlerAndTimeouts(t *testing.T) {
-	config := defaultServerConfig()
+	config := testServerConfig()
 	config.HTTPSPort = 9443
 	config.StaticDirectory = t.TempDir()
 
@@ -470,6 +472,104 @@ func TestNewHTTPServerConfiguresAddressHandlerAndTimeouts(t *testing.T) {
 	server.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/upload", nil))
 	if response.Code != http.StatusUnauthorized {
 		t.Errorf("upload route status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestUploadCredentialsRequireBothEnvironmentValues(t *testing.T) {
+	tests := []struct {
+		name     string
+		username string
+		password string
+		wantErr  bool
+	}{
+		{name: "both configured", username: "local-user", password: "local-password"},
+		{name: "missing username", password: "local-password", wantErr: true},
+		{name: "missing password", username: "local-user", wantErr: true},
+		{name: "blank credentials", username: " ", password: "\t", wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			values := map[string]string{
+				uploadUsernameEnv: test.username,
+				uploadPasswordEnv: test.password,
+			}
+			credentials, err := uploadCredentialsFromEnvironment(func(key string) string {
+				return values[key]
+			})
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("loading missing credentials succeeded, want error")
+				}
+				if (strings.TrimSpace(test.username) != "" && strings.Contains(err.Error(), test.username)) ||
+					(strings.TrimSpace(test.password) != "" && strings.Contains(err.Error(), test.password)) {
+					t.Errorf("credential error exposes a secret value: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("load configured credentials: %v", err)
+			}
+			if credentials.username != test.username || credentials.password != test.password {
+				t.Fatal("loaded credentials do not match supplied values")
+			}
+		})
+	}
+}
+
+func TestUploadAuthenticationFailsClosedWhenNotConfigured(t *testing.T) {
+	config := defaultServerConfig()
+	config.StaticDirectory = t.TempDir()
+	handler := newConfiguredHTTPHandler(config)
+	request := httptest.NewRequest(http.MethodPost, "/upload", nil)
+	request.SetBasicAuth("", "")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Errorf("unconfigured upload auth status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestHTTPLoggingDoesNotIncludeCredentialsAuthorizationOrUploadBody(t *testing.T) {
+	var logs bytes.Buffer
+	previousLogOutput := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() {
+		log.SetOutput(previousLogOutput)
+	})
+
+	config := testServerConfig()
+	config.StaticDirectory = t.TempDir()
+	config.UploadDirectory = filepath.Join(t.TempDir(), "uploads")
+	handler := newConfiguredHTTPHandler(config)
+
+	rootResponse := httptest.NewRecorder()
+	handler.ServeHTTP(rootResponse, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	const privatePayload = "private-upload-payload"
+	uploadResponse := httptest.NewRecorder()
+	handler.ServeHTTP(uploadResponse, newUploadRequest(t, "private.txt", privatePayload))
+	if uploadResponse.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, want %d", uploadResponse.Code, http.StatusOK)
+	}
+
+	logOutput := logs.String()
+	for _, expected := range []string{"GET /", "POST /upload"} {
+		if !strings.Contains(logOutput, expected) {
+			t.Errorf("logs %q do not include route entry %q", logOutput, expected)
+		}
+	}
+	for _, secret := range []string{
+		testUploadUsername,
+		testUploadPassword,
+		"Authorization",
+		"Basic ",
+		privatePayload,
+	} {
+		if strings.Contains(logOutput, secret) {
+			t.Errorf("logs expose sensitive value %q: %s", secret, logOutput)
+		}
 	}
 }
 
@@ -606,8 +706,22 @@ func newUploadRequest(t *testing.T, filename, content string) *http.Request {
 
 	request := httptest.NewRequest(http.MethodPost, "/upload", &body)
 	request.Header.Set("Content-Type", writer.FormDataContentType())
-	request.SetBasicAuth("admin", "goserve123")
+	request.SetBasicAuth(testUploadUsername, testUploadPassword)
 	return request
+}
+
+const (
+	testUploadUsername = "test-upload-user"
+	testUploadPassword = "test-upload-password"
+)
+
+func testServerConfig() serverConfig {
+	config := defaultServerConfig()
+	config.UploadAuth = uploadCredentials{
+		username: testUploadUsername,
+		password: testUploadPassword,
+	}
+	return config
 }
 
 type errorAfterBytesReader struct {
