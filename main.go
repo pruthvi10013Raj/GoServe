@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -79,6 +80,46 @@ func createUniqueUploadFile(directory, filename string) (*os.File, string, error
 	}
 }
 
+func sanitizeUploadFilename(filename string) (string, error) {
+	filename = strings.ReplaceAll(filename, `\`, "/")
+	filename = filepath.Base(filename)
+	if filename == "" || filename == "." || filename == ".." ||
+		strings.ContainsAny(filename, `/\`) || strings.ContainsRune(filename, '\x00') {
+		return "", fmt.Errorf("invalid upload filename")
+	}
+	return filename, nil
+}
+
+func saveUploadedFile(directory, filename string, source io.Reader) (string, error) {
+	filename, err := sanitizeUploadFilename(filename)
+	if err != nil {
+		return "", err
+	}
+
+	outputFile, outputPath, err := createUniqueUploadFile(directory, filename)
+	if err != nil {
+		return "", fmt.Errorf("create upload file: %w", err)
+	}
+
+	_, copyErr := io.Copy(outputFile, source)
+	closeErr := outputFile.Close()
+	saveErr := error(nil)
+	if copyErr != nil {
+		saveErr = fmt.Errorf("write upload file: %w", copyErr)
+	}
+	if closeErr != nil {
+		saveErr = errors.Join(saveErr, fmt.Errorf("close upload file: %w", closeErr))
+	}
+	if saveErr != nil {
+		if removeErr := os.Remove(outputPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return "", errors.Join(saveErr, fmt.Errorf("remove incomplete upload: %w", removeErr))
+		}
+		return "", saveErr
+	}
+
+	return filepath.Base(outputPath), nil
+}
+
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	config := defaultServerConfig()
 	uploadHandlerWithConfig(w, r, config)
@@ -94,11 +135,20 @@ func uploadHandlerWithConfig(w http.ResponseWriter, r *http.Request, config serv
 
 	err := r.ParseMultipartForm(config.MaxUploadSize)
 	if r.MultipartForm != nil {
-		defer r.MultipartForm.RemoveAll()
+		defer func() {
+			if err := r.MultipartForm.RemoveAll(); err != nil {
+				log.Printf("Unable to clean multipart temporary files: %v", err)
+			}
+		}()
 	}
 
 	if err != nil {
-		http.Error(w, "File too large or invalid upload", http.StatusBadRequest)
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			http.Error(w, "Upload too large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "Invalid multipart upload", http.StatusBadRequest)
+		}
 		return
 	}
 
@@ -109,9 +159,17 @@ func uploadHandlerWithConfig(w http.ResponseWriter, r *http.Request, config serv
 		return
 	}
 
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			log.Printf("Unable to close uploaded request file: %v", err)
+		}
+	}()
 
-	filename := filepath.Base(header.Filename)
+	filename, err := sanitizeUploadFilename(header.Filename)
+	if err != nil {
+		http.Error(w, "Invalid filename", http.StatusBadRequest)
+		return
+	}
 
 	if err := os.MkdirAll(config.UploadDirectory, 0755); err != nil {
 		log.Printf("Unable to create upload directory: %v", err)
@@ -119,35 +177,14 @@ func uploadHandlerWithConfig(w http.ResponseWriter, r *http.Request, config serv
 		return
 	}
 
-	outputFile, outputPath, err := createUniqueUploadFile(config.UploadDirectory, filename)
+	savedFilename, err := saveUploadedFile(config.UploadDirectory, filename, file)
 	if err != nil {
-		log.Printf("Unable to create upload file: %v", err)
+		log.Printf("Unable to save upload file: %v", err)
 		http.Error(w, "Unable to save file", http.StatusInternalServerError)
 		return
 	}
 
-	_, err = io.Copy(outputFile, file)
-	closeErr := outputFile.Close()
-
-	if err != nil {
-		if removeErr := os.Remove(outputPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			log.Printf("Unable to remove incomplete upload: %v", removeErr)
-		}
-		log.Printf("Unable to write upload file: %v", err)
-		http.Error(w, "Unable to write file", http.StatusInternalServerError)
-		return
-	}
-
-	if closeErr != nil {
-		if removeErr := os.Remove(outputPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			log.Printf("Unable to remove incomplete upload: %v", removeErr)
-		}
-		log.Printf("Unable to close upload file: %v", closeErr)
-		http.Error(w, "Unable to save file", http.StatusInternalServerError)
-		return
-	}
-
-	fmt.Fprintf(w, "File uploaded successfully: %s\n", filepath.Base(outputPath))
+	fmt.Fprintf(w, "File uploaded successfully: %s\n", savedFilename)
 }
 
 func newHTTPHandler(directory string) http.Handler {

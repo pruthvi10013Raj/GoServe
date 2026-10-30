@@ -167,20 +167,11 @@ func TestHandleTCPConnectionClosesIdleClientAfterDeadline(t *testing.T) {
 }
 
 func TestUploadHandlerCreatesDirectoryAndUniqueNames(t *testing.T) {
-	workingDirectory, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chdir(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := os.Chdir(workingDirectory); err != nil {
-			t.Errorf("restore working directory: %v", err)
-		}
-	})
-
-	handler := newHTTPHandler(t.TempDir())
+	uploadDirectory := filepath.Join(t.TempDir(), "uploads")
+	config := defaultServerConfig()
+	config.StaticDirectory = t.TempDir()
+	config.UploadDirectory = uploadDirectory
+	handler := newConfiguredHTTPHandler(config)
 	first := postUpload(t, handler, "test.txt", "first upload")
 	second := postUpload(t, handler, "test.txt", "second upload")
 
@@ -201,13 +192,87 @@ func TestUploadHandlerCreatesDirectoryAndUniqueNames(t *testing.T) {
 		"test.txt":   "first upload",
 		"test_1.txt": "second upload",
 	} {
-		got, err := os.ReadFile(filepath.Join("uploads", filename))
+		got, err := os.ReadFile(filepath.Join(uploadDirectory, filename))
 		if err != nil {
 			t.Fatalf("read %s: %v", filename, err)
 		}
 		if string(got) != want {
 			t.Errorf("%s contents = %q, want %q", filename, got, want)
 		}
+	}
+}
+
+func TestUploadHandlerRejectsInvalidAndMissingFileFields(t *testing.T) {
+	config := defaultServerConfig()
+	config.StaticDirectory = t.TempDir()
+	config.UploadDirectory = filepath.Join(t.TempDir(), "uploads")
+	handler := newConfiguredHTTPHandler(config)
+
+	invalidRequest := httptest.NewRequest(http.MethodPost, "/upload", strings.NewReader("not multipart"))
+	invalidRequest.Header.Set("Content-Type", "text/plain")
+	invalidRequest.SetBasicAuth("admin", "goserve123")
+	invalidResponse := httptest.NewRecorder()
+	handler.ServeHTTP(invalidResponse, invalidRequest)
+	if invalidResponse.Code != http.StatusBadRequest {
+		t.Errorf("invalid multipart status = %d, want %d", invalidResponse.Code, http.StatusBadRequest)
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("other", "value"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	missingRequest := httptest.NewRequest(http.MethodPost, "/upload", &body)
+	missingRequest.Header.Set("Content-Type", writer.FormDataContentType())
+	missingRequest.SetBasicAuth("admin", "goserve123")
+	missingResponse := httptest.NewRecorder()
+	handler.ServeHTTP(missingResponse, missingRequest)
+	if missingResponse.Code != http.StatusBadRequest {
+		t.Errorf("missing file status = %d, want %d", missingResponse.Code, http.StatusBadRequest)
+	}
+}
+
+func TestUploadHandlerSanitizesClientFilename(t *testing.T) {
+	uploadDirectory := filepath.Join(t.TempDir(), "uploads")
+	config := defaultServerConfig()
+	config.StaticDirectory = t.TempDir()
+	config.UploadDirectory = uploadDirectory
+	handler := newConfiguredHTTPHandler(config)
+
+	response := postUpload(t, handler, `..\..\escape.txt`, "safe contents")
+	if response.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if want := "File uploaded successfully: escape.txt\n"; response.Body.String() != want {
+		t.Fatalf("response = %q, want %q", response.Body.String(), want)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(uploadDirectory), "escape.txt")); !os.IsNotExist(err) {
+		t.Errorf("file was created outside upload directory; stat error = %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(uploadDirectory, "escape.txt"))
+	if err != nil {
+		t.Fatalf("read sanitized upload: %v", err)
+	}
+	if string(got) != "safe contents" {
+		t.Errorf("uploaded content = %q, want %q", got, "safe contents")
+	}
+}
+
+func TestSaveUploadedFileRemovesPartialFileOnReadError(t *testing.T) {
+	directory := t.TempDir()
+	_, err := saveUploadedFile(directory, "partial.txt", &errorAfterBytesReader{})
+	if err == nil {
+		t.Fatal("save with failing source succeeded, want an error")
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatalf("read upload directory: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("directory contains partial uploads: %v", entries)
 	}
 }
 
@@ -257,6 +322,58 @@ func TestCreateUniqueUploadFileIsSafeForConcurrentCalls(t *testing.T) {
 	}
 	if len(seen) != uploadCount {
 		t.Errorf("allocated %d unique paths, want %d", len(seen), uploadCount)
+	}
+}
+
+func TestUploadHandlerAllocatesUniqueNamesForConcurrentDuplicates(t *testing.T) {
+	const uploadCount = 16
+	uploadDirectory := filepath.Join(t.TempDir(), "uploads")
+	config := defaultServerConfig()
+	config.StaticDirectory = t.TempDir()
+	config.UploadDirectory = uploadDirectory
+	handler := newConfiguredHTTPHandler(config)
+
+	requests := make([]*http.Request, uploadCount)
+	responses := make([]*httptest.ResponseRecorder, uploadCount)
+	for i := 0; i < uploadCount; i++ {
+		requests[i] = newUploadRequest(t, "shared.txt", fmt.Sprintf("upload %d", i))
+		responses[i] = httptest.NewRecorder()
+	}
+
+	var workers sync.WaitGroup
+	for i := range requests {
+		workers.Add(1)
+		go func(index int) {
+			defer workers.Done()
+			handler.ServeHTTP(responses[index], requests[index])
+		}(i)
+	}
+	workers.Wait()
+
+	seen := make(map[string]bool, uploadCount)
+	for i, response := range responses {
+		if response.Code != http.StatusOK {
+			t.Errorf("upload %d status = %d, want %d: %s", i, response.Code, http.StatusOK, response.Body.String())
+			continue
+		}
+		filename := strings.TrimPrefix(response.Body.String(), "File uploaded successfully: ")
+		filename = strings.TrimSpace(filename)
+		if seen[filename] {
+			t.Errorf("duplicate upload filename allocated: %s", filename)
+			continue
+		}
+		seen[filename] = true
+		got, err := os.ReadFile(filepath.Join(uploadDirectory, filename))
+		if err != nil {
+			t.Errorf("read concurrent upload %s: %v", filename, err)
+			continue
+		}
+		if want := fmt.Sprintf("upload %d", i); string(got) != want {
+			t.Errorf("%s contents = %q, want %q", filename, got, want)
+		}
+	}
+	if len(seen) != uploadCount {
+		t.Errorf("allocated %d unique filenames, want %d", len(seen), uploadCount)
 	}
 }
 
@@ -316,8 +433,8 @@ func TestConfiguredHTTPHandlerUsesUploadDirectoryAndSizeLimit(t *testing.T) {
 	}
 
 	tooLarge := postUpload(t, handler, "large.txt", strings.Repeat("x", 1024))
-	if tooLarge.Code != http.StatusBadRequest {
-		t.Errorf("oversized upload status = %d, want %d", tooLarge.Code, http.StatusBadRequest)
+	if tooLarge.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("oversized upload status = %d, want %d", tooLarge.Code, http.StatusRequestEntityTooLarge)
 	}
 	if _, err := os.Stat(filepath.Join(uploadDirectory, "large.txt")); !os.IsNotExist(err) {
 		t.Errorf("oversized upload file exists or stat failed unexpectedly: %v", err)
@@ -465,6 +582,15 @@ func TestShutdownHTTPServerWaitsForActiveRequest(t *testing.T) {
 func postUpload(t *testing.T, handler http.Handler, filename, content string) *httptest.ResponseRecorder {
 	t.Helper()
 
+	request := newUploadRequest(t, filename, content)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
+func newUploadRequest(t *testing.T, filename, content string) *http.Request {
+	t.Helper()
+
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	part, err := writer.CreateFormFile("file", filename)
@@ -481,7 +607,17 @@ func postUpload(t *testing.T, handler http.Handler, filename, content string) *h
 	request := httptest.NewRequest(http.MethodPost, "/upload", &body)
 	request.Header.Set("Content-Type", writer.FormDataContentType())
 	request.SetBasicAuth("admin", "goserve123")
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
-	return response
+	return request
+}
+
+type errorAfterBytesReader struct {
+	read bool
+}
+
+func (reader *errorAfterBytesReader) Read(buffer []byte) (int, error) {
+	if reader.read {
+		return 0, errors.New("simulated source read failure")
+	}
+	reader.read = true
+	return copy(buffer, "partial contents"), errors.New("simulated source read failure")
 }
