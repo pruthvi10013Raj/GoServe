@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,7 +10,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -18,6 +22,7 @@ const (
 	tcpConnectionTimeout = 5 * time.Second
 	readHeaderTimeout    = 5 * time.Second
 	idleTimeout          = 60 * time.Second
+	httpShutdownTimeout  = 10 * time.Second
 )
 
 func basicAuth(next http.Handler) http.Handler {
@@ -219,55 +224,147 @@ func handleTCPConnectionWithTimeout(conn net.Conn, timeout time.Duration) {
 	}
 }
 
-func startTCPServer(port string) {
+type tcpServer struct {
+	listener   net.Listener
+	mu         sync.Mutex
+	conns      map[net.Conn]struct{}
+	handlers   sync.WaitGroup
+	acceptDone chan struct{}
+	closing    bool
+}
 
-	listener, err := net.Listen("tcp", port)
-
+func startTCPServer(address string) (*tcpServer, error) {
+	listener, err := net.Listen("tcp", address)
 	if err != nil {
-		log.Println("TCP server error:", err)
-		return
+		return nil, fmt.Errorf("start TCP server on %s: %w", address, err)
 	}
 
-	defer listener.Close()
+	server := &tcpServer{
+		listener:   listener,
+		conns:      make(map[net.Conn]struct{}),
+		acceptDone: make(chan struct{}),
+	}
+	log.Println("GoServe TCP server running on", listener.Addr())
+	go server.acceptConnections()
+	return server, nil
+}
 
-	log.Println("GoServe TCP server running on", port)
-
+func (server *tcpServer) acceptConnections() {
+	defer close(server.acceptDone)
 	for {
-		conn, err := listener.Accept()
-
+		conn, err := server.listener.Accept()
 		if err != nil {
-			log.Println("TCP connection error:", err)
-			continue
+			server.mu.Lock()
+			closing := server.closing
+			server.mu.Unlock()
+			if !closing {
+				log.Println("TCP connection error:", err)
+			}
+			return
 		}
 
-		go handleTCPConnection(conn)
+		server.mu.Lock()
+		if server.closing {
+			server.mu.Unlock()
+			_ = conn.Close()
+			continue
+		}
+		server.conns[conn] = struct{}{}
+		server.handlers.Add(1)
+		server.mu.Unlock()
+
+		go func() {
+			defer server.handlers.Done()
+			defer func() {
+				server.mu.Lock()
+				delete(server.conns, conn)
+				server.mu.Unlock()
+			}()
+			handleTCPConnection(conn)
+		}()
 	}
 }
 
-func run(args []string) error {
+func (server *tcpServer) shutdown() error {
+	server.mu.Lock()
+	server.closing = true
+	var shutdownErr error
+	if err := server.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close TCP listener: %w", err))
+	}
+	for conn := range server.conns {
+		if closeErr := conn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("close TCP client: %w", closeErr))
+		}
+	}
+	server.mu.Unlock()
+
+	<-server.acceptDone
+	server.handlers.Wait()
+	return shutdownErr
+}
+
+func shutdownHTTPServer(server *http.Server) error {
+	ctx, cancel := context.WithTimeout(context.Background(), httpShutdownTimeout)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		closeErr := server.Close()
+		if closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
+			return errors.Join(fmt.Errorf("gracefully shut down HTTPS server: %w", err), fmt.Errorf("force-close HTTPS server: %w", closeErr))
+		}
+		return fmt.Errorf("gracefully shut down HTTPS server: %w", err)
+	}
+	return nil
+}
+
+func run(ctx context.Context, args []string) error {
 	config, err := parseServerConfig(args)
 	if err != nil {
 		return err
 	}
 
-	go startTCPServer(fmt.Sprintf(":%d", config.TCPPort))
+	tcp, err := startTCPServer(fmt.Sprintf(":%d", config.TCPPort))
+	if err != nil {
+		return err
+	}
 
 	server := newHTTPServer(config)
 	fmt.Printf("GoServe running on https://localhost%s\n", server.Addr)
 	fmt.Printf("Serving directory: %s\n", config.StaticDirectory)
 
-	if err := server.ListenAndServeTLS(
-		"cert/server.crt",
-		"cert/server.key",
-	); err != nil {
-		return fmt.Errorf("HTTPS server stopped: %w", err)
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- server.ListenAndServeTLS("cert/server.crt", "cert/server.key")
+	}()
+
+	select {
+	case <-ctx.Done():
+		tcpErr := tcp.shutdown()
+		httpErr := shutdownHTTPServer(server)
+		if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			httpErr = errors.Join(httpErr, fmt.Errorf("HTTPS server stopped: %w", err))
+		}
+		return errors.Join(tcpErr, httpErr)
+	case err := <-serveErr:
+		tcpErr := tcp.shutdown()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return errors.Join(fmt.Errorf("HTTPS server stopped: %w", err), tcpErr)
+		}
+		return tcpErr
 	}
-	return nil
 }
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	if err := runWithSignals(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func runWithSignals(args []string) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	return run(ctx, args)
 }
