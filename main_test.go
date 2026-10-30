@@ -323,6 +323,38 @@ func TestConfiguredHTTPHandlerUsesUploadDirectoryAndSizeLimit(t *testing.T) {
 	}
 }
 
+func TestNewHTTPServerConfiguresAddressHandlerAndTimeouts(t *testing.T) {
+	config := defaultServerConfig()
+	config.HTTPSPort = 9443
+	config.StaticDirectory = t.TempDir()
+
+	server := newHTTPServer(config)
+	if server.Addr != ":9443" {
+		t.Errorf("server address = %q, want %q", server.Addr, ":9443")
+	}
+	if server.Handler == nil {
+		t.Fatal("server handler is nil")
+	}
+	if server.ReadHeaderTimeout != 5*time.Second {
+		t.Errorf("read-header timeout = %v, want %v", server.ReadHeaderTimeout, 5*time.Second)
+	}
+	if server.IdleTimeout != 60*time.Second {
+		t.Errorf("idle timeout = %v, want %v", server.IdleTimeout, 60*time.Second)
+	}
+
+	response := httptest.NewRecorder()
+	server.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/hello.txt", nil))
+	if response.Code != http.StatusNotFound {
+		t.Errorf("static route status = %d, want %d", response.Code, http.StatusNotFound)
+	}
+
+	response = httptest.NewRecorder()
+	server.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/upload", nil))
+	if response.Code != http.StatusUnauthorized {
+		t.Errorf("upload route status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+}
+
 func postUpload(t *testing.T, handler http.Handler, filename, content string) *httptest.ResponseRecorder {
 	t.Helper()
 

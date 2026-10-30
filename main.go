@@ -16,6 +16,8 @@ import (
 const (
 	maxTCPRequestSize    = 1024
 	tcpConnectionTimeout = 5 * time.Second
+	readHeaderTimeout    = 5 * time.Second
+	idleTimeout          = 60 * time.Second
 )
 
 func basicAuth(next http.Handler) http.Handler {
@@ -158,6 +160,15 @@ func newConfiguredHTTPHandler(config serverConfig) http.Handler {
 	return mux
 }
 
+func newHTTPServer(config serverConfig) *http.Server {
+	return &http.Server{
+		Addr:              fmt.Sprintf(":%d", config.HTTPSPort),
+		Handler:           newConfiguredHTTPHandler(config),
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+	}
+}
+
 func handleTCPConnection(conn net.Conn) {
 	handleTCPConnectionWithTimeout(conn, tcpConnectionTimeout)
 }
@@ -241,15 +252,13 @@ func run(args []string) error {
 
 	go startTCPServer(fmt.Sprintf(":%d", config.TCPPort))
 
-	address := fmt.Sprintf(":%d", config.HTTPSPort)
-	fmt.Printf("GoServe running on https://localhost%s\n", address)
+	server := newHTTPServer(config)
+	fmt.Printf("GoServe running on https://localhost%s\n", server.Addr)
 	fmt.Printf("Serving directory: %s\n", config.StaticDirectory)
 
-	if err := http.ListenAndServeTLS(
-		address,
+	if err := server.ListenAndServeTLS(
 		"cert/server.crt",
 		"cert/server.key",
-		newConfiguredHTTPHandler(config),
 	); err != nil {
 		return fmt.Errorf("HTTPS server stopped: %w", err)
 	}
