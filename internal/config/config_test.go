@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"os"
@@ -8,7 +8,7 @@ import (
 )
 
 func TestDefaultServerConfig(t *testing.T) {
-	config := defaultServerConfig()
+	config := Default()
 	if config.HTTPSPort != 8443 || config.TCPPort != 9090 {
 		t.Errorf("default ports = (%d, %d), want (8443, 9090)", config.HTTPSPort, config.TCPPort)
 	}
@@ -21,11 +21,11 @@ func TestDefaultServerConfig(t *testing.T) {
 }
 
 func TestLoadServerConfigWithoutPathUsesDefaults(t *testing.T) {
-	config, err := loadServerConfig("")
+	config, err := Load("")
 	if err != nil {
 		t.Fatalf("load defaults without config path: %v", err)
 	}
-	defaults := defaultServerConfig()
+	defaults := Default()
 	if config != defaults {
 		t.Errorf("config without path = %+v, want defaults %+v", config, defaults)
 	}
@@ -33,10 +33,10 @@ func TestLoadServerConfigWithoutPathUsesDefaults(t *testing.T) {
 
 func TestLoadServerConfigMissingFileReturnsError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.yaml")
-	if _, err := loadServerConfig(path); err == nil {
+	if _, err := Load(path); err == nil {
 		t.Fatal("loading missing config file succeeded, want an error")
 	}
-	if _, err := parseServerConfig([]string{"-config", path}); err == nil {
+	if _, err := Parse([]string{"-config", path}); err == nil {
 		t.Fatal("starting with a missing config file succeeded, want an error")
 	}
 }
@@ -48,7 +48,7 @@ func TestLoadServerConfigOverlaysYAMLOnDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	config, err := loadServerConfig(path)
+	config, err := Load(path)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
@@ -64,14 +64,14 @@ func TestLoadServerConfigOverlaysYAMLOnDefaults(t *testing.T) {
 }
 
 func TestApplyConfigOverridesPrecedence(t *testing.T) {
-	config := serverConfig{
+	config := Config{
 		HTTPSPort:       9443,
 		TCPPort:         9191,
 		StaticDirectory: "./yaml-public",
 		UploadDirectory: "./yaml-uploads",
 		MaxUploadSize:   2048,
 	}
-	overrides := serverConfig{
+	overrides := Config{
 		HTTPSPort:       10443,
 		TCPPort:         9292,
 		StaticDirectory: "./cli-public",
@@ -83,7 +83,7 @@ func TestApplyConfigOverridesPrecedence(t *testing.T) {
 		"upload-dir":      true,
 		"max-upload-size": true,
 	}
-	if err := applyConfigOverrides(&config, overrides, explicit); err != nil {
+	if err := ApplyOverrides(&config, overrides, explicit); err != nil {
 		t.Fatal(err)
 	}
 	if config.HTTPSPort != 10443 || config.TCPPort != 9191 {
@@ -102,7 +102,7 @@ func TestApplyConfigOverridesRejectsConflictingAliases(t *testing.T) {
 		{"https-port": true, "port": true},
 		{"static-dir": true, "dir": true},
 	} {
-		if err := applyConfigOverrides(&serverConfig{}, serverConfig{}, explicit); err == nil {
+		if err := ApplyOverrides(&Config{}, Config{}, explicit); err == nil {
 			t.Errorf("apply overrides for %v succeeded, want conflict error", explicit)
 		}
 	}
@@ -128,7 +128,7 @@ func TestParseServerConfigAppliesCLIOverYAML(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	config, err := parseServerConfig([]string{
+	config, err := Parse([]string{
 		"-config", path,
 		"-https-port", "10443",
 		"-tcp-port", "9292",
@@ -152,7 +152,7 @@ func TestParseServerConfigAppliesCLIOverYAML(t *testing.T) {
 
 func TestParseServerConfigPreservesLegacyFlags(t *testing.T) {
 	staticDirectory := t.TempDir()
-	config, err := parseServerConfig([]string{"-port", "9443", "-dir", staticDirectory})
+	config, err := Parse([]string{"-port", "9443", "-dir", staticDirectory})
 	if err != nil {
 		t.Fatalf("parse legacy flags: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestLoadServerConfigRejectsUnknownFieldsAndMultipleDocuments(t *testing.T) 
 		if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := loadServerConfig(path); err == nil {
+		if _, err := Load(path); err == nil {
 			t.Errorf("load config %q succeeded, want error", contents)
 		}
 	}
@@ -186,7 +186,7 @@ func TestLoadServerConfigRejectsInvalidYAMLValues(t *testing.T) {
 			if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := loadServerConfig(path); err == nil {
+			if _, err := Load(path); err == nil {
 				t.Fatalf("load config %q succeeded, want an error", contents)
 			}
 		})
@@ -214,7 +214,7 @@ func TestParseServerConfigRejectsInvalidYAMLSettings(t *testing.T) {
 			if err := os.WriteFile(path, []byte(data), 0600); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := parseServerConfig([]string{"-config", path}); err == nil {
+			if _, err := Parse([]string{"-config", path}); err == nil {
 				t.Fatalf("parse invalid setting %q succeeded, want an error", test.value)
 			}
 		})
@@ -224,24 +224,24 @@ func TestParseServerConfigRejectsInvalidYAMLSettings(t *testing.T) {
 func TestServerConfigValidation(t *testing.T) {
 	tests := []struct {
 		name   string
-		change func(*serverConfig)
+		change func(*Config)
 	}{
-		{"https port below range", func(c *serverConfig) { c.HTTPSPort = 0 }},
-		{"https port above range", func(c *serverConfig) { c.HTTPSPort = 65536 }},
-		{"tcp port below range", func(c *serverConfig) { c.TCPPort = 0 }},
-		{"tcp port above range", func(c *serverConfig) { c.TCPPort = 65536 }},
-		{"blank static directory", func(c *serverConfig) { c.StaticDirectory = "  " }},
-		{"blank upload directory", func(c *serverConfig) { c.UploadDirectory = "" }},
-		{"nonpositive upload limit", func(c *serverConfig) { c.MaxUploadSize = 0 }},
-		{"missing static directory", func(c *serverConfig) { c.StaticDirectory = filepath.Join(t.TempDir(), "missing") }},
-		{"static path is a file", func(c *serverConfig) {
+		{"https port below range", func(c *Config) { c.HTTPSPort = 0 }},
+		{"https port above range", func(c *Config) { c.HTTPSPort = 65536 }},
+		{"tcp port below range", func(c *Config) { c.TCPPort = 0 }},
+		{"tcp port above range", func(c *Config) { c.TCPPort = 65536 }},
+		{"blank static directory", func(c *Config) { c.StaticDirectory = "  " }},
+		{"blank upload directory", func(c *Config) { c.UploadDirectory = "" }},
+		{"nonpositive upload limit", func(c *Config) { c.MaxUploadSize = 0 }},
+		{"missing static directory", func(c *Config) { c.StaticDirectory = filepath.Join(t.TempDir(), "missing") }},
+		{"static path is a file", func(c *Config) {
 			path := filepath.Join(t.TempDir(), "file")
 			if err := os.WriteFile(path, nil, 0600); err != nil {
 				t.Fatal(err)
 			}
 			c.StaticDirectory = path
 		}},
-		{"upload path has file parent", func(c *serverConfig) {
+		{"upload path has file parent", func(c *Config) {
 			path := filepath.Join(t.TempDir(), "file")
 			if err := os.WriteFile(path, nil, 0600); err != nil {
 				t.Fatal(err)
@@ -251,11 +251,11 @@ func TestServerConfigValidation(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			config := defaultServerConfig()
+			config := Default()
 			config.StaticDirectory = t.TempDir()
 			config.UploadDirectory = t.TempDir()
 			test.change(&config)
-			if err := config.validate(); err == nil {
+			if err := config.Validate(); err == nil {
 				t.Fatalf("validation error = %v, want a clear validation error", err)
 			} else if strings.TrimSpace(err.Error()) == "" {
 				t.Fatal("validation error message is empty")
@@ -265,10 +265,10 @@ func TestServerConfigValidation(t *testing.T) {
 }
 
 func TestServerConfigAcceptsMissingUploadDirectoryWithExistingParent(t *testing.T) {
-	config := defaultServerConfig()
+	config := Default()
 	config.StaticDirectory = t.TempDir()
 	config.UploadDirectory = filepath.Join(t.TempDir(), "not-created-yet")
-	if err := config.validate(); err != nil {
+	if err := config.Validate(); err != nil {
 		t.Fatalf("config with creatable upload directory is invalid: %v", err)
 	}
 }

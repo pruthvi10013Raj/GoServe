@@ -1,15 +1,12 @@
-package main
+package httpserver
 
 import (
-	"bufio"
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"mime/multipart"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,198 +15,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"goserve/internal/config"
 )
-
-func TestHandleTCPConnectionRespondsWithReceivedMessage(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	defer clientConn.Close()
-
-	serverDone := make(chan struct{})
-	go func() {
-		defer close(serverDone)
-		handleTCPConnection(serverConn)
-	}()
-
-	if _, err := clientConn.Write([]byte("hello GoServe\r\n")); err != nil {
-		t.Fatalf("write request: %v", err)
-	}
-
-	if err := clientConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatalf("set read deadline: %v", err)
-	}
-
-	response, err := bufio.NewReader(clientConn).ReadString('\n')
-	if err != nil {
-		t.Fatalf("read response: %v", err)
-	}
-	if want := "Received: hello GoServe\n"; response != want {
-		t.Errorf("response = %q, want %q", response, want)
-	}
-	if _, err := bufio.NewReader(clientConn).ReadByte(); err != io.EOF {
-		t.Errorf("read after response error = %v, want EOF", err)
-	}
-	select {
-	case <-serverDone:
-	case <-time.After(time.Second):
-		t.Fatal("server handler did not return after responding")
-	}
-}
-
-func TestHandleTCPConnectionAcceptsEmptyRequest(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	defer clientConn.Close()
-
-	go handleTCPConnection(serverConn)
-
-	if _, err := clientConn.Write([]byte("\n")); err != nil {
-		t.Fatalf("write empty request: %v", err)
-	}
-
-	if err := clientConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatalf("set read deadline: %v", err)
-	}
-
-	response, err := bufio.NewReader(clientConn).ReadString('\n')
-	if err != nil {
-		t.Fatalf("read response: %v", err)
-	}
-	if want := "Received: \n"; response != want {
-		t.Errorf("response = %q, want %q", response, want)
-	}
-}
-
-func TestHandleTCPConnectionRejectsOversizedRequest(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	defer clientConn.Close()
-
-	go handleTCPConnection(serverConn)
-	if _, err := clientConn.Write([]byte(strings.Repeat("x", maxTCPRequestSize+1) + "\n")); err != nil {
-		t.Fatalf("write oversized request: %v", err)
-	}
-
-	if err := clientConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatalf("set read deadline: %v", err)
-	}
-
-	response, err := bufio.NewReader(clientConn).ReadString('\n')
-	if err != nil {
-		t.Fatalf("read response: %v", err)
-	}
-	if want := "ERR request too long\n"; response != want {
-		t.Errorf("response = %q, want %q", response, want)
-	}
-}
-
-func TestHandleTCPConnectionAcceptsMaximumRequest(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	defer clientConn.Close()
-
-	go handleTCPConnection(serverConn)
-	message := strings.Repeat("x", maxTCPRequestSize)
-	if _, err := clientConn.Write([]byte(message + "\n")); err != nil {
-		t.Fatalf("write maximum request: %v", err)
-	}
-	if err := clientConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatalf("set read deadline: %v", err)
-	}
-
-	response, err := bufio.NewReader(clientConn).ReadString('\n')
-	if err != nil {
-		t.Fatalf("read response: %v", err)
-	}
-	if want := "Received: " + message + "\n"; response != want {
-		t.Errorf("response length = %d, want %d", len(response), len(want))
-	}
-}
-
-func TestHandleTCPConnectionAcceptsMaximumCRLFRequest(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	defer clientConn.Close()
-
-	go handleTCPConnection(serverConn)
-	message := strings.Repeat("x", maxTCPRequestSize)
-	if _, err := clientConn.Write([]byte(message + "\r\n")); err != nil {
-		t.Fatalf("write maximum CRLF request: %v", err)
-	}
-	if err := clientConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatalf("set read deadline: %v", err)
-	}
-
-	response, err := bufio.NewReader(clientConn).ReadString('\n')
-	if err != nil {
-		t.Fatalf("read response: %v", err)
-	}
-	if want := "Received: " + message + "\n"; response != want {
-		t.Errorf("response length = %d, want %d", len(response), len(want))
-	}
-}
-
-func TestHandleTCPConnectionRejectsOversizedCRLFRequest(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	defer clientConn.Close()
-
-	go handleTCPConnection(serverConn)
-	message := strings.Repeat("x", maxTCPRequestSize+1)
-	go func() {
-		_, _ = clientConn.Write([]byte(message + "\r\n"))
-	}()
-	if err := clientConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatalf("set read deadline: %v", err)
-	}
-
-	response, err := bufio.NewReader(clientConn).ReadString('\n')
-	if err != nil {
-		t.Fatalf("read response: %v", err)
-	}
-	if want := "ERR request too long\n"; response != want {
-		t.Errorf("response = %q, want %q", response, want)
-	}
-}
-
-func TestHandleTCPConnectionReturnsAfterClientDisconnect(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	serverDone := make(chan struct{})
-	go func() {
-		defer close(serverDone)
-		handleTCPConnection(serverConn)
-	}()
-
-	if _, err := clientConn.Write([]byte("partial")); err != nil {
-		t.Fatalf("write partial request: %v", err)
-	}
-	if err := clientConn.Close(); err != nil {
-		t.Fatalf("close client connection: %v", err)
-	}
-
-	select {
-	case <-serverDone:
-	case <-time.After(time.Second):
-		t.Fatal("server handler did not return after client disconnect")
-	}
-}
-
-func TestHandleTCPConnectionClosesIdleClientAfterDeadline(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
-	defer clientConn.Close()
-
-	serverDone := make(chan struct{})
-	go func() {
-		defer close(serverDone)
-		handleTCPConnectionWithTimeout(serverConn, 50*time.Millisecond)
-	}()
-
-	if err := clientConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatalf("set read deadline: %v", err)
-	}
-	if _, err := bufio.NewReader(clientConn).ReadByte(); err != io.EOF {
-		t.Fatalf("read from idle connection error = %v, want EOF", err)
-	}
-	select {
-	case <-serverDone:
-	case <-time.After(time.Second):
-		t.Fatal("server handler did not return after read deadline")
-	}
-}
 
 func TestUploadHandlerCreatesDirectoryAndUniqueNames(t *testing.T) {
 	uploadDirectory := filepath.Join(t.TempDir(), "uploads")
@@ -536,10 +344,10 @@ func TestUploadCredentialsRequireBothEnvironmentValues(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			values := map[string]string{
-				uploadUsernameEnv: test.username,
-				uploadPasswordEnv: test.password,
+				usernameEnv: test.username,
+				passwordEnv: test.password,
 			}
-			credentials, err := uploadCredentialsFromEnvironment(func(key string) string {
+			credentials, err := CredentialsFromEnvironment(func(key string) string {
 				return values[key]
 			})
 			if test.wantErr {
@@ -555,7 +363,7 @@ func TestUploadCredentialsRequireBothEnvironmentValues(t *testing.T) {
 			if err != nil {
 				t.Fatalf("load configured credentials: %v", err)
 			}
-			if credentials.username != test.username || credentials.password != test.password {
+			if credentials.Username != test.username || credentials.Password != test.password {
 				t.Fatal("loaded credentials do not match supplied values")
 			}
 		})
@@ -606,38 +414,6 @@ func TestUploadRoutePreservesAuthenticationAndMethodStatuses(t *testing.T) {
 	}
 }
 
-func TestRunCleansTCPListenerWhenHTTPSStartupFails(t *testing.T) {
-	reservation, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tcpPort := reservation.Addr().(*net.TCPAddr).Port
-	if err := reservation.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	t.Setenv(uploadUsernameEnv, testUploadUsername)
-	t.Setenv(uploadPasswordEnv, testUploadPassword)
-	staticDirectory := t.TempDir()
-	startupErr := errors.New("simulated TLS certificate startup failure")
-	err = runWithHTTPS(context.Background(), []string{
-		"-https-port", fmt.Sprint(tcpPort),
-		"-tcp-port", fmt.Sprint(tcpPort),
-		"-static-dir", staticDirectory,
-	}, func(*http.Server) error {
-		return startupErr
-	})
-	if !errors.Is(err, startupErr) || !strings.Contains(err.Error(), "HTTPS server stopped") {
-		t.Fatalf("run error = %v, want wrapped HTTPS startup error", err)
-	}
-
-	connection, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", fmt.Sprint(tcpPort)), 100*time.Millisecond)
-	if err == nil {
-		_ = connection.Close()
-		t.Fatal("TCP listener still accepts connections after HTTPS startup failed")
-	}
-}
-
 func TestHTTPLoggingDoesNotIncludeCredentialsAuthorizationOrUploadBody(t *testing.T) {
 	var logs bytes.Buffer
 	previousLogOutput := log.Writer()
@@ -680,112 +456,6 @@ func TestHTTPLoggingDoesNotIncludeCredentialsAuthorizationOrUploadBody(t *testin
 	}
 }
 
-func TestTCPServerShutdownClosesListenerAndActiveClients(t *testing.T) {
-	server, err := startTCPServer("127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("start TCP server: %v", err)
-	}
-
-	client, err := net.Dial("tcp", server.listener.Addr().String())
-	if err != nil {
-		t.Fatalf("connect TCP client: %v", err)
-	}
-	defer client.Close()
-
-	if _, err := io.WriteString(client, "unfinished"); err != nil {
-		t.Fatalf("write partial request: %v", err)
-	}
-	deadline := time.Now().Add(time.Second)
-	for {
-		server.mu.Lock()
-		activeConnections := len(server.conns)
-		server.mu.Unlock()
-		if activeConnections > 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("TCP server did not register the client connection")
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	if err := server.shutdown(); err != nil {
-		t.Fatalf("shutdown TCP server: %v", err)
-	}
-	if err := client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatalf("set client read deadline: %v", err)
-	}
-	if _, err := client.Read(make([]byte, 1)); err == nil {
-		t.Error("client read after shutdown succeeded, want closed connection")
-	}
-	if _, err := net.DialTimeout("tcp", server.listener.Addr().String(), 100*time.Millisecond); err == nil {
-		t.Error("new connection after shutdown succeeded, want refused connection")
-	}
-}
-
-func TestShutdownHTTPServerWaitsForActiveRequest(t *testing.T) {
-	requestStarted := make(chan struct{})
-	releaseRequest := make(chan struct{})
-	server := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			close(requestStarted)
-			<-releaseRequest
-			_, _ = io.WriteString(w, "finished")
-		}),
-	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	serveDone := make(chan error, 1)
-	go func() {
-		serveDone <- server.Serve(listener)
-	}()
-
-	responseDone := make(chan error, 1)
-	go func() {
-		response, err := http.Get("http://" + listener.Addr().String())
-		if err == nil {
-			defer response.Body.Close()
-			_, err = io.Copy(io.Discard, response.Body)
-		}
-		responseDone <- err
-	}()
-	select {
-	case <-requestStarted:
-	case <-time.After(time.Second):
-		close(releaseRequest)
-		t.Fatal("HTTP request did not reach handler")
-	}
-
-	shutdownDone := make(chan error, 1)
-	go func() {
-		shutdownDone <- shutdownHTTPServer(server)
-	}()
-
-	select {
-	case err := <-shutdownDone:
-		close(releaseRequest)
-		t.Fatalf("shutdown returned before active request ended: %v", err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	close(releaseRequest)
-	select {
-	case err := <-shutdownDone:
-		if err != nil {
-			t.Fatalf("graceful HTTP shutdown: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("HTTP shutdown did not complete after active request was released")
-	}
-	if err := <-responseDone; err != nil {
-		t.Errorf("active HTTP request: %v", err)
-	}
-	if err := <-serveDone; !errors.Is(err, http.ErrServerClosed) {
-		t.Errorf("Serve error = %v, want %v", err, http.ErrServerClosed)
-	}
-}
-
 func postUpload(t *testing.T, handler http.Handler, filename, content string) *httptest.ResponseRecorder {
 	t.Helper()
 
@@ -824,9 +494,9 @@ const (
 
 func testServerConfig() serverConfig {
 	config := defaultServerConfig()
-	config.UploadAuth = uploadCredentials{
-		username: testUploadUsername,
-		password: testUploadPassword,
+	config.UploadAuth = Credentials{
+		Username: testUploadUsername,
+		Password: testUploadPassword,
 	}
 	return config
 }
@@ -841,4 +511,21 @@ func (reader *errorAfterBytesReader) Read(buffer []byte) (int, error) {
 	}
 	reader.read = true
 	return copy(buffer, "partial contents"), errors.New("simulated source read failure")
+}
+
+type serverConfig struct {
+	config.Config
+	UploadAuth Credentials
+}
+
+func defaultServerConfig() serverConfig {
+	return serverConfig{Config: config.Default()}
+}
+
+func newConfiguredHTTPHandler(serverConfig serverConfig) http.Handler {
+	return NewHandler(ServerConfig{Config: serverConfig.Config, UploadAuth: serverConfig.UploadAuth})
+}
+
+func newHTTPServer(serverConfig serverConfig) *http.Server {
+	return NewServer(ServerConfig{Config: serverConfig.Config, UploadAuth: serverConfig.UploadAuth})
 }

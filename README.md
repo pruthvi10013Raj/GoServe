@@ -7,7 +7,9 @@ ready.
 
 ## Features and architecture
 
-- The root Go package starts the HTTPS and TCP listeners.
+- The `cmd/goserve` executable starts the HTTPS and TCP listeners. Internal
+  packages separate configuration, HTTP handlers, TCP protocol/server logic,
+  and application lifecycle.
 - HTTPS serves files from the configured static directory and exposes
   `POST /upload`.
 - Only uploads require HTTP Basic Authentication. Credentials are read from
@@ -39,15 +41,17 @@ Go downloads the YAML dependency declared in `go.mod` when needed.
 ```text
 GoServe/
 ├── cmd/
+│   ├── goserve/          # Server executable
 │   └── tcp-client/       # Standalone TCP command-line client and tests
+├── internal/
+│   ├── app/              # Server startup and graceful shutdown
+│   ├── config/           # YAML, defaults, CLI precedence, validation
+│   ├── httpserver/       # HTTPS routes, upload handler, middleware
+│   └── tcp/              # TCP protocol, listener and connection lifecycle
 ├── public/               # Static content served over HTTPS
 ├── cert/                 # Local TLS certificate and private key (generated)
 ├── uploads/              # Uploaded files (created when needed)
-├── config.go             # YAML, defaults, CLI precedence, validation
 ├── config.example.yaml   # Safe, secret-free example settings
-├── config_test.go
-├── main.go               # HTTPS/TCP servers, routes, upload and shutdown
-├── main_test.go
 ├── go.mod
 └── go.sum
 ```
@@ -117,13 +121,13 @@ Precedence is **built-in defaults < YAML values < explicitly supplied CLI
 flags**. Start with the sample:
 
 ```powershell
-go run . -config config.example.yaml
+go run ./cmd/goserve -config config.example.yaml
 ```
 
 Override one value at the command line:
 
 ```powershell
-go run . -config config.example.yaml -https-port 9443
+go run ./cmd/goserve -config config.example.yaml -https-port 9443
 ```
 
 Available flags are `-config`, `-https-port`, `-tcp-port`, `-static-dir`,
@@ -162,7 +166,7 @@ The upload endpoint accepts a multipart `file` field. The repository includes
 `test.txt` for a local example. In the server terminal, with the variables set:
 
 ```powershell
-go run . -config config.example.yaml
+go run ./cmd/goserve -config config.example.yaml
 ```
 
 In a second terminal, set the same local credentials and upload `test.txt`;
@@ -203,7 +207,7 @@ app in Terminal 1:
 
 ```powershell
 Set-Location C:\Users\Pruthvi\GoServe
-go run . -config config.example.yaml
+go run ./cmd/goserve -config config.example.yaml
 ```
 
 In Terminal 2, check static HTTPS content:
@@ -249,7 +253,7 @@ TCP listener and active clients are closed.
 ## Tests and static checks
 
 ```powershell
-gofmt -w config.go config_test.go main.go main_test.go cmd\tcp-client\main.go cmd\tcp-client\main_test.go
+gofmt -l .
 go test ./...
 go vet ./...
 go test -race ./...
