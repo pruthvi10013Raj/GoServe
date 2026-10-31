@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"errors"
@@ -12,13 +12,12 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-type serverConfig struct {
+type Config struct {
 	HTTPSPort       int
 	TCPPort         int
 	StaticDirectory string
 	UploadDirectory string
 	MaxUploadSize   int64
-	UploadAuth      uploadCredentials
 }
 
 type yamlServerConfig struct {
@@ -29,8 +28,8 @@ type yamlServerConfig struct {
 	MaxUploadSize   *int64  `yaml:"max_upload_size"`
 }
 
-func defaultServerConfig() serverConfig {
-	return serverConfig{
+func Default() Config {
+	return Config{
 		HTTPSPort:       8443,
 		TCPPort:         9090,
 		StaticDirectory: "./public",
@@ -39,15 +38,15 @@ func defaultServerConfig() serverConfig {
 	}
 }
 
-func loadServerConfig(path string) (serverConfig, error) {
-	config := defaultServerConfig()
+func Load(path string) (Config, error) {
+	config := Default()
 	if path == "" {
 		return config, nil
 	}
 
 	file, err := os.Open(path)
 	if err != nil {
-		return serverConfig{}, fmt.Errorf("open config file: %w", err)
+		return Config{}, fmt.Errorf("open config file: %w", err)
 	}
 	defer file.Close()
 
@@ -55,14 +54,14 @@ func loadServerConfig(path string) (serverConfig, error) {
 	decoder.KnownFields(true)
 	var values yamlServerConfig
 	if err := decoder.Decode(&values); err != nil {
-		return serverConfig{}, fmt.Errorf("decode config file: %w", err)
+		return Config{}, fmt.Errorf("decode config file: %w", err)
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		if err == nil {
-			return serverConfig{}, errors.New("config file must contain only one YAML document")
+			return Config{}, errors.New("config file must contain only one YAML document")
 		}
-		return serverConfig{}, fmt.Errorf("decode config file: %w", err)
+		return Config{}, fmt.Errorf("decode config file: %w", err)
 	}
 
 	if values.HTTPSPort != nil {
@@ -84,7 +83,7 @@ func loadServerConfig(path string) (serverConfig, error) {
 	return config, nil
 }
 
-func (config serverConfig) validate() error {
+func (config Config) Validate() error {
 	if config.HTTPSPort < 1 || config.HTTPSPort > 65535 {
 		return fmt.Errorf("HTTPS port must be between 1 and 65535")
 	}
@@ -135,7 +134,7 @@ func validateUploadDirectoryPath(path string) error {
 	}
 }
 
-func applyConfigOverrides(config *serverConfig, overrides serverConfig, explicit map[string]bool) error {
+func ApplyOverrides(config *Config, overrides Config, explicit map[string]bool) error {
 	if explicit["https-port"] && explicit["port"] {
 		return fmt.Errorf("use only one of -https-port and -port")
 	}
@@ -163,8 +162,8 @@ func applyConfigOverrides(config *serverConfig, overrides serverConfig, explicit
 	return nil
 }
 
-func parseServerConfig(args []string) (serverConfig, error) {
-	defaults := defaultServerConfig()
+func Parse(args []string) (Config, error) {
+	defaults := Default()
 	flags := flag.NewFlagSet("goserve", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 
@@ -182,32 +181,32 @@ func parseServerConfig(args []string) (serverConfig, error) {
 	flags.StringVar(&uploadDirectory, "upload-dir", defaults.UploadDirectory, "Upload files directory")
 	flags.Int64Var(&maxUploadSize, "max-upload-size", defaults.MaxUploadSize, "Maximum upload size in bytes")
 	if err := flags.Parse(args); err != nil {
-		return serverConfig{}, err
+		return Config{}, err
 	}
 	if flags.NArg() != 0 {
-		return serverConfig{}, fmt.Errorf("unexpected positional arguments: %s", strings.Join(flags.Args(), " "))
+		return Config{}, fmt.Errorf("unexpected positional arguments: %s", strings.Join(flags.Args(), " "))
 	}
 
-	config, err := loadServerConfig(*configPath)
+	config, err := Load(*configPath)
 	if err != nil {
-		return serverConfig{}, err
+		return Config{}, err
 	}
 	explicitFlags := make(map[string]bool)
 	flags.Visit(func(f *flag.Flag) {
 		explicitFlags[f.Name] = true
 	})
-	overrides := serverConfig{
+	overrides := Config{
 		HTTPSPort:       httpsPort,
 		TCPPort:         tcpPort,
 		StaticDirectory: staticDirectory,
 		UploadDirectory: uploadDirectory,
 		MaxUploadSize:   maxUploadSize,
 	}
-	if err := applyConfigOverrides(&config, overrides, explicitFlags); err != nil {
-		return serverConfig{}, err
+	if err := ApplyOverrides(&config, overrides, explicitFlags); err != nil {
+		return Config{}, err
 	}
-	if err := config.validate(); err != nil {
-		return serverConfig{}, err
+	if err := config.Validate(); err != nil {
+		return Config{}, err
 	}
 	return config, nil
 }
